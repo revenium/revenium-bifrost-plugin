@@ -267,9 +267,19 @@ func main() {
 		failf("start bifrost-http: %v", err)
 	}
 
-	// 6) Poll readiness with a 10s deadline. On failure, dump bifrost.log to
+	// 6) Poll readiness with a 60s deadline. On failure, dump bifrost.log to
 	//    stderr so the CI runner log shows what went wrong.
-	if err := waitForBifrost(bifrostBaseURL, time.Now().Add(10*time.Second)); err != nil {
+	//
+	//    Why 60s and not 10s: on a cold start bifrost-http performs a BLOCKING
+	//    model-catalog network sync before it serves health. On the CI
+	//    `macos-15-intel` runner this was observed downloading 4,661 pricing
+	//    records and 12,247 model-parameter records at T+4s/T+5s, which leaves
+	//    no margin inside a 10s budget — the harness failed deterministically
+	//    there (reproduced on an isolated re-run), not as a flake. waitForBifrost
+	//    polls in a loop and returns the instant health succeeds, so a longer
+	//    deadline costs nothing on a fast runner; it only buys headroom on a
+	//    slow, cold one.
+	if err := waitForBifrost(bifrostBaseURL, time.Now().Add(60*time.Second)); err != nil {
 		_ = logFile.Sync()
 		if b, readErr := os.ReadFile(bifrostLogPath); readErr == nil {
 			fmt.Fprintln(os.Stderr, "--- bifrost.log (startup failure) ---")
