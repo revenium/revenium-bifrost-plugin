@@ -64,7 +64,12 @@ bifrost-host:
 	GOTOOLCHAIN=$(GOTOOLCHAIN) $(GO) mod download github.com/maximhq/bifrost/transports@v1.5.3
 	rm -rf $(BIFROST_BUILD_TMP)
 	mkdir -p $(BIFROST_BUILD_TMP)
-	cp -R $$($(GO) env GOMODCACHE)/github.com/maximhq/bifrost/transports@v1.5.3/ $(BIFROST_BUILD_TMP)/
+# The trailing `/.` on the cp SOURCE below is deliberate: GNU cp (Linux) given a
+# trailing `/` copies the DIRECTORY ITSELF, while BSD cp (macOS) copies its
+# CONTENTS. The `/.` form means "contents" on both. Without it, Linux nests the
+# tree one level deeper, the mkdir below then materializes an EMPTY
+# bifrost-http/, and the go build fails with `no Go files`.
+	cp -R $$($(GO) env GOMODCACHE)/github.com/maximhq/bifrost/transports@v1.5.3/. $(BIFROST_BUILD_TMP)/
 	chmod -R u+w $(BIFROST_BUILD_TMP)
 	mkdir -p $(BIFROST_BUILD_TMP)/bifrost-http/ui
 	printf '%s\n' '<!-- ui stub for Phase-1 source build; Plan 06 spike does not exercise UI -->' > $(BIFROST_BUILD_TMP)/bifrost-http/ui/index.html
