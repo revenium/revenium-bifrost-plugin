@@ -1,0 +1,29 @@
+version: "2"
+
+run:
+  # golangci-lint accepts only major.minor for the Go version directive.
+  # Pin to 1.26 (matches the go 1.26.2 directive in go.mod).
+  go: "1.26"
+  timeout: 5m
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - unused
+    - ineffassign
+    - gosec
+    - bodyclose       # Critical: budget-check Phase 2 HTTP response body (Pitfall 5 readiness).
+    - errorlint
+    - forcetypeassert # Critical: ctx.Value casts must use comma-ok (Pitfall 7).
+    - gocritic
+
+issues:
+  # Spike code is its own module (Plan 06) and would be double-linted against
+  # the main module's rules. Phase 1 keeps the lint scope to the production tree.
+  exclude-dirs:
+    - spike
+    - bin
+    - dist

@@ -1,0 +1,19 @@
+.planning/**
+!.planning/phases/
+!.planning/phases/**/
+!.planning/phases/01-foundation-bifrost-contract-spike/01-SPIKE-FINDINGS.md
+!.planning/phases/01-foundation-bifrost-contract-spike/01-spike-trace.log
+.cache/
+
+# Build artifacts
+*.so
+/bin/
+/dist/
+.bifrost-tmp/
+coverage.out
+*.test
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

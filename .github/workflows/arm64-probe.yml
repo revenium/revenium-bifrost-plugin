@@ -1,0 +1,50 @@
+# ARM64 Runner Probe
+#
+# Purpose: empirical confirmation that the `ubuntu-24.04-arm` GitHub-hosted
+# runner is available on this org's GitHub Actions plan. Closes Phase 4
+# 04-RESEARCH.md Open Question 2 + Assumption A4 (linux/arm64 runner
+# availability) before Plan 04-02 commits the 4-runner native CI matrix.
+#
+# Operator action:
+#   1. Navigate to GitHub Actions UI -> "ARM64 Runner Probe" -> Run workflow.
+#   2. Confirm the workflow schedules within ~60s (not stuck in a queue).
+#   3. Confirm the "Probe runner availability" step prints
+#      `available on Linux/ARM64` (or similar) and `uname -a` shows
+#      `aarch64`/`arm64` in the kernel string.
+#   4. Once confirmed, Plan 04-02 may commit the matrix expansion that
+#      includes the `ubuntu-24.04-arm` row.
+#
+# Fallback: if the workflow stays queued for >5 min or fails to schedule
+# at all, document the result in `.continue-here.md` and fall back to a
+# 3-runner matrix (drop arm64) with an explicit README disclaimer per
+# 04-CONTEXT.md Pitfall 16 (linux/arm64 runner availability).
+#
+# Scope: this is a one-shot diagnostic, NOT part of the per-PR gate. It is
+# deliberately excluded from `ci.yml`'s on:pull_request trigger so it never
+# runs automatically — operator-gated via workflow_dispatch only.
+
+name: ARM64 Runner Probe
+
+on:
+  workflow_dispatch: {}
+
+# Least-privilege token scope: the probe reads nothing repo-side and writes
+# nothing back to the repo. `contents: read` is sufficient for the implicit
+# `actions/checkout@v4` step.
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        # Checkout is included so the operator can see in the Actions UI
+        # which commit the probe ran against. The probe itself does not
+        # exercise any repo code; this step exists for audit-trail value.
+        uses: actions/checkout@v4
+
+      - name: Probe runner availability
+        run: |
+          echo "available on ${{ runner.os }}/${{ runner.arch }}"
+          uname -a

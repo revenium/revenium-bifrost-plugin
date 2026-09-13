@@ -1,0 +1,221 @@
+name: CI
+
+on:
+  pull_request: {}
+  push:
+    branches: [main]
+
+# Workflow-scope GOTOOLCHAIN pin: every `go` invocation in every step refuses
+# to silently auto-upgrade to a different patch (Pitfall 14).
+env:
+  GOTOOLCHAIN: go1.26.2
+
+# Least-privilege token scope; Phase 4 widens this explicitly for the release
+# pipeline that uploads artifacts to GitHub Releases.
+permissions:
+  contents: read
+
+jobs:
+  # Phase 4 Plan 04-02 (BUILD-02 + BUILD-03 + BUILD-04) expands the original
+  # single-runner ubuntu-24.04 job to a 4-runner NATIVE matrix:
+  #
+  #   - ubuntu-24.04         → linux/amd64
+  #   - ubuntu-24.04-arm     → linux/arm64   (D-37 + Pitfall 16 — availability
+  #                            confirmed via Plan 04-01's arm64-probe.yml)
+  #   - macos-15-intel       → darwin/amd64  (D-37 amendment 2026-05-24 +
+  #                            Pitfall 2 — the prior macOS-Intel runner label
+  #                            was retired 2025-12-08; macos-15-intel is the
+  #                            current canonical Intel-macOS label, supported
+  #                            until ~2027-08)
+  #   - macos-14             → darwin/arm64
+  #
+  # `-buildmode=plugin` does NOT cross-compile cleanly (the runtime ABI must
+  # match the host toolchain at link time; CGO + plugin mode requires linking
+  # against the target's libc/dyld) — therefore 4 native runners are the only
+  # legal shape. NEVER fall back to QEMU emulation for plugin builds
+  # (verified-broken per 04-RESEARCH.md §Anti-Patterns + Pitfall 16).
+  #
+  # `fail-fast: false` is MANDATORY (anti-pattern callout in 04-RESEARCH.md
+  # §Pattern 1) — the default `true` cancels in-flight rows when one fails,
+  # which masks per-runner toolchain drift signal precisely when it's most
+  # valuable.
+  lint-test-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            goos: linux
+            goarch: amd64
+          - runner: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+          - runner: macos-15-intel
+            goos: darwin
+            goarch: amd64
+          - runner: macos-14
+            goos: darwin
+            goarch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go 1.26.2
+        uses: actions/setup-go@v5
+        with:
+          # EXACT pin — not "1.26" (range) and not "1.26.x" (range).
+          # Both ranges silently auto-upgrade (Pitfall 14).
+          go-version: "1.26.2"
+          check-latest: false
+          # Caches ~/go/pkg/mod + ~/.cache/go-build (the Go module cache +
+          # go-build cache); the separate actions/cache@v4 step below caches
+          # the bifrost-http binary itself, which lives OUTSIDE both
+          # (04-RESEARCH.md Pitfall 4 — they coexist without conflict).
+          cache: true
+
+      - name: Pin GOTOOLCHAIN
+        run: echo "GOTOOLCHAIN=go1.26.2" >> $GITHUB_ENV
+
+      - name: Verify Go version
+        # Trailing space guards against matching go1.26.20 etc.
+        run: go version | grep -q "go1.26.2 "
+
+      - name: Compute Bifrost transports tag
+        # Consumes Plan 04-01's `print-bifrost-tag` Makefile target — D-35.1
+        # single source of truth. Bumping the supported Bifrost compat range
+        # is a single Makefile edit; this step picks it up automatically.
+        id: bifrost-tag
+        run: echo "tag=$(make print-bifrost-tag)" >> $GITHUB_OUTPUT
+
+      - name: Restore bifrost-http cache
+        # D-35 + 04-RESEARCH.md §Pattern 4: cache `bin/bifrost-http` keyed on
+        # (OS, arch, Go version, transports tag, go.sum hash). Restore-keys
+        # ladder allows cross-PR sharing when only go.sum changes, and
+        # within-tag fallback when the transports tag is unchanged.
+        # Pitfall 5: this step MUST run BEFORE `Install tools` so a `go
+        # install` doesn't invalidate the cache lookup by recreating bin/.
+        id: bifrost-cache
+        uses: actions/cache@v4
+        with:
+          path: bin/bifrost-http
+          key: bifrost-http-${{ runner.os }}-${{ matrix.goarch }}-go1.26.2-${{ steps.bifrost-tag.outputs.tag }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            bifrost-http-${{ runner.os }}-${{ matrix.goarch }}-go1.26.2-${{ steps.bifrost-tag.outputs.tag }}-
+            bifrost-http-${{ runner.os }}-${{ matrix.goarch }}-go1.26.2-
+
+      - name: Build bifrost-host (on cache miss)
+        if: steps.bifrost-cache.outputs.cache-hit != 'true'
+        run: make bifrost-host
+
+      - name: Cache result summary
+        # CONTEXT.md Discretion item 2: one-glance visibility for CI run
+        # debugging. Renders into the per-run summary tab. Body is a literal
+        # block scalar so the `:` inside the GitHub-expression ternary doesn't
+        # confuse YAML parsers.
+        run: |
+          echo "bifrost-http cache (${{ matrix.runner }}/${{ matrix.goarch }}): ${{ steps.bifrost-cache.outputs.cache-hit == 'true' && 'HIT' || 'MISS' }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Install tools
+        # MUST come AFTER the bifrost-http cache restore (Pitfall 5 — `go
+        # install` could otherwise invalidate the cache lookup by recreating
+        # bin/).
+        run: make tools
+
+      - name: CI pipeline
+        run: make ci
+
+      - name: Ad-hoc codesign (macOS only)
+        # BUILD-04 + D-37.3 + 04-RESEARCH.md §Pattern 6 + Pitfall 9: macOS 11+
+        # Apple Silicon requires ALL loaded binaries — including dylibs/dlopen'd
+        # .so files — to carry at least an ad-hoc signature, or `dlopen` fails
+        # with EXC_BAD_ACCESS. Linux .so files do NOT need this; gate by OS.
+        # `--force` is idempotent-replace (Go's macOS linker MAY apply a
+        # default ad-hoc signature; --force avoids the "already signed" error).
+        # `--timestamp=none` suppresses the Apple timestamp-server call which
+        # would fail in CI anyway.
+        if: runner.os == 'macOS'
+        run: |
+          codesign --sign - --timestamp=none --force revenium-bifrost.so
+          codesign -dvvv revenium-bifrost.so 2>&1 | grep -q "Signature=adhoc"
+
+      - name: Verify .so symbol presence
+        # During Plans 02 + 03 the .so doesn't exist yet (Plan 04 wires
+        # plugin.go); the conditional keeps CI green across the scaffolding
+        # plans. Once the .so exists, nm enforces the seven-symbol contract
+        # (HTTPTransportPreHook added in Phase 2 Plan 02-02 per D-18).
+        #
+        # Phase 4 Plan 04-01 corrected the regex prefix: `-buildmode=plugin`
+        # emits symbols under the MODULE-IMPORT-PATH prefix
+        # `github.com/revenium/revenium-bifrost-plugin.<Name>` — NOT `plugin.<Name>`.
+        # The old `plugin\.` regex matched ZERO symbols (verified empirically
+        # 2026-05-23 — see 04-RESEARCH.md §Pattern 7). The `_?` tolerates
+        # Mach-O's leading-underscore symbol naming so the SAME regex works
+        # on Linux (ELF, no underscore) and macOS (Mach-O, underscore prefix)
+        # across the 4-runner native matrix.
+        run: |
+          if [ -f revenium-bifrost.so ]; then
+            echo "Plugin .so present — asserting symbol table"
+            count=$(nm revenium-bifrost.so | grep -cE ' T _?github\.com/revenium/revenium-bifrost-plugin\.(Init|GetName|Cleanup|HTTPTransportPreHook|PreLLMHook|PostLLMHook|HTTPTransportStreamChunkHook)$')
+            if [ "$count" != "7" ]; then echo "Symbol count $count != 7 — see Pitfall 5 ( -ldflags=-s/-w breaks plugin.Lookup)" && exit 1; fi
+          else
+            echo "revenium-bifrost.so not yet built (expected during scaffolding plans 02-04); skipping symbol check"
+          fi
+
+      - name: Verify build flags (BUILD-03)
+        # BUILD-03 + 04-RESEARCH.md §Pattern 8: assert the frozen build flags
+        # are present (CGO_ENABLED=1, -trimpath, -buildmode=plugin) AND assert
+        # the forbidden strip flags are ABSENT (-ldflags=-s, -ldflags=-w break
+        # plugin.Lookup at load time per Pitfall 5).
+        run: |
+          if [ ! -f revenium-bifrost.so ]; then
+            echo "revenium-bifrost.so not present — skipping build-flag verification"
+            exit 0
+          fi
+          info=$(go version -m revenium-bifrost.so)
+          echo "$info" | grep -qE "build[[:space:]]+-trimpath=true" || (echo "MISSING -trimpath=true flag (BUILD-03 Pitfall 5)"; exit 1)
+          echo "$info" | grep -qE "build[[:space:]]+-buildmode=plugin" || (echo "MISSING -buildmode=plugin flag (BUILD-03)"; exit 1)
+          echo "$info" | grep -qE "build[[:space:]]+CGO_ENABLED=1" || (echo "MISSING CGO_ENABLED=1 flag (BUILD-03)"; exit 1)
+          # Negative assertions — Pitfall 5: -ldflags=-s and -ldflags=-w strip
+          # the symbol table that plugin.Lookup walks at runtime. If either
+          # appears in buildinfo, the build is broken.
+          if echo "$info" | grep -qE "ldflags.*[-]s"; then echo "FORBIDDEN -ldflags=-s detected (Pitfall 5 — breaks plugin.Lookup)"; exit 1; fi
+          if echo "$info" | grep -qE "ldflags.*[-]w"; then echo "FORBIDDEN -ldflags=-w detected (Pitfall 5 — breaks plugin.Lookup)"; exit 1; fi
+          echo "BUILD-03 flag verification PASSED"
+
+      - name: Pluginsanity tests
+        # After Plan 04-02 Task 1 this also exercises TestPlugin_SoloaderSignatures
+        # (TEST-02 reflection assertion — D-34 / D-34.1 / Pitfall 8). The 9-row
+        # multi-provider matrix (TestPlugin_Phase3MultiProviderMatrix) gracefully
+        # `t.Skipf`s rows whose fixtures are not yet captured (per Plan 03-04
+        # Task 2 deferral + Plan 04-01 Task 1 BLOCKED branch).
+        run: go test -tags pluginsanity -count=1 ./...
+
+      # BUILD-05 + D-35.2 + RESEARCH §Pitfall 7: per-runner plugin.Open smoke.
+      # Runs BEFORE the integration step so each step starts from a clean
+      # process state with its own bifrost-http instance (smoke is the cheap
+      # toolchain/symbol-drift detector that fails fast on regression; the
+      # integration suite is the deeper-but-slower assertion). Exercises the
+      # freshly-built (and on macOS, ad-hoc codesigned) .so via a real
+      # bifrost-http subprocess + a fake-OpenAI server + one chat-completion
+      # POST, then SIGTERMs and asserts the SIGTERM-to-Cleanup delta >= 1s
+      # (D-35.2 floor; Phase 1 spike captured 2.115383s with a deliberate 2s
+      # Cleanup sleep, production plugin's Cleanup has no deliberate sleep).
+      - name: BUILD-05 smoke (per-runner plugin.Open via bifrost-http)
+        run: ./scripts/build05-smoke.sh
+
+      # TEST-03 + D-33.2 + RESEARCH §Pitfall 7: wire-level integration suite
+      # on all 4 matrix runners every PR. Runs AFTER the BUILD-05 smoke (so
+      # each step starts from a clean process state with its own bifrost-http
+      # instance). The sub-module under test/integration/ has its own go.mod
+      # (D-04 isolation) — `cd` is mandatory because the integration build
+      # tag + module deps are NOT visible from the plugin's main module.
+      # `-count=1` bypasses Go's test result cache (Phases 1/2/3 discipline).
+      # `REVENIUM_METERING_API_KEY` is set step-level: the fake_revenium
+      # server ignores it but the plugin's Init requires it to be non-empty
+      # per CONFIG-01; the integration suite's TestMain otherwise has no way
+      # to satisfy the plugin's startup contract.
+      - name: Integration tests (TEST-03 wire scenarios)
+        env:
+          REVENIUM_METERING_API_KEY: integration-fake-key
+        run: cd test/integration && go test -tags integration -count=1 -timeout 180s -v .

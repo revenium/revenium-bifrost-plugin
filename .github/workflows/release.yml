@@ -1,0 +1,335 @@
+# Phase 4 Plan 04-05 (BUILD-06) — tag-triggered release pipeline.
+#
+# Decisions consumed (see .planning/phases/04-multi-provider-test-matrix-native-four-runner-release-pipeli/04-CONTEXT.md):
+#   - D-37    : split into ci.yml (PR + push to main) and release.yml (tag push);
+#               tagging IS the release; `permissions: contents: write` scoped to
+#               just the final `release` job, NOT workflow-level.
+#   - D-37.1  : AMENDED 2026-05-24 — OSS-only path via softprops/action-gh-release@v2
+#               + shell `sha256sum`. The v2 prebuilt-builder packaging tool
+#               considered in the prior decision is Pro-only — wire-identical
+#               artifacts result. NO release-config YAML is needed.
+#   - D-37.2  : per-artifact `.sha256` PLUS a single combined `checksums.txt`.
+#               Filename convention: revenium-bifrost_<TAG>_<GOOS>_<GOARCH>_go1.26.2.so
+#               (canonical version-bearing shape; explicitly resolves the
+#               REQUIREMENTS BUILD-06 example wording in favor of carrying the
+#               version segment so the filename alone identifies the artifact).
+#   - D-37.3  : macOS ad-hoc codesign only (`codesign --sign - --timestamp=none`);
+#               Apple Developer ID + notarization deferred to OPS-03.
+#
+# Research findings consumed (see 04-RESEARCH.md):
+#   - Headline Finding #1 disposition (b)  : OSS-only via softprops; the Pro-only
+#                                             prebuilt-builder packaging path is rejected.
+#   - Pattern 4 (cache ordering)           : actions/cache@v4 BEFORE `make tools`.
+#   - Pattern 5 (cross-job artifact handoff): upload-artifact@v4 per matrix row,
+#                                             download-artifact@v4 with merge-multiple.
+#   - Pattern 6 (macOS codesign)            : `--sign - --timestamp=none --force`.
+#   - Pattern 7 (nm symbol regex)           : module-import-path prefix, `_?` for Mach-O.
+#   - Pattern 8 (build flag assertions)     : -trimpath / -buildmode=plugin / CGO_ENABLED=1
+#                                             positive; -ldflags=-s / -ldflags=-w negative.
+#   - Pattern 9 (least-privilege + softprops): job-level contents:write only on `release`;
+#                                              changelog from `git log <prev>..HEAD`.
+#
+# Pitfalls actively honored:
+#   - Pitfall 2  : matrix uses `macos-15-intel` (the canonical Intel-macOS label as of
+#                  2026; the prior Intel-macOS runner label was retired 2025-12-08).
+#   - Pitfall 3  : softprops/action-gh-release@v2 is tag-pinned in Phase 4; Phase 5
+#                  (DOC-02 / public-export cleanup) will SHA-pin all community actions.
+#   - Pitfall 5  : `-ldflags=-s` and `-ldflags=-w` strip the symbol table that
+#                  `plugin.Lookup` walks at runtime; build-flag verification step
+#                  asserts both ABSENT (negative assertion).
+#   - Pitfall 14 : workflow-scope `GOTOOLCHAIN: go1.26.2` env + exact-pin
+#                  `go-version: "1.26.2"` (never `1.26.x`).
+#   - Pitfall 16 : QEMU emulation is verified-broken for `-buildmode=plugin`;
+#                  4 NATIVE runners are the only legal shape.
+#
+# Triggers ONLY on `push.tags: ['v*']` per D-37 (no workflow_dispatch — see
+# 04-CONTEXT.md Deferred Ideas item 4). Re-running a half-failed release uses the
+# GitHub Actions UI re-run button on this workflow's run page.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Workflow-scope GOTOOLCHAIN pin: every `go` invocation in every step refuses
+# to silently auto-upgrade to a different patch (Pitfall 14). Matches ci.yml.
+env:
+  GOTOOLCHAIN: go1.26.2
+
+# Least-privilege workflow-level default (Pattern 9). The matrix `build` jobs
+# inherit `contents: read`; only the final `release` job overrides this to
+# `contents: write` for the GitHub Release upload (T-04-05-02 mitigation).
+permissions:
+  contents: read
+
+jobs:
+  # Matrix build mirrors ci.yml's lint-test-build shape verbatim so that pre-release
+  # regression in toolchain / symbol / build-flag drift is impossible: if ci.yml
+  # passed on a commit, release.yml's matrix builds the SAME `.so` from the SAME
+  # toolchain on the SAME 4 runners. Cross-compile is structurally impossible for
+  # `-buildmode=plugin` (Pitfall 16). DRY-fighting against ci.yml deferred per
+  # 04-RESEARCH.md Open Question 5 — duplication is acceptable until a third caller
+  # appears.
+  build:
+    strategy:
+      # MANDATORY false (anti-pattern callout in 04-RESEARCH.md §Pattern 1) — the
+      # default `true` cancels in-flight rows when one fails, which masks per-runner
+      # toolchain drift signal precisely when it's most valuable (Pitfall 14).
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            goos: linux
+            goarch: amd64
+          - runner: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+          - runner: macos-15-intel
+            goos: darwin
+            goarch: amd64
+          - runner: macos-14
+            goos: darwin
+            goarch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        # No fetch-depth here — the release job (which renders the changelog)
+        # is the only step that needs the full history.
+        uses: actions/checkout@v4
+
+      - name: Setup Go 1.26.2
+        uses: actions/setup-go@v5
+        with:
+          # EXACT pin — not "1.26" (range) and not "1.26.x" (range).
+          # Both ranges silently auto-upgrade (Pitfall 14).
+          go-version: "1.26.2"
+          check-latest: false
+          cache: true
+
+      - name: Pin GOTOOLCHAIN
+        run: echo "GOTOOLCHAIN=go1.26.2" >> $GITHUB_ENV
+
+      - name: Verify Go version
+        # Trailing space guards against matching go1.26.20 etc.
+        run: go version | grep -q "go1.26.2 "
+
+      - name: Compute Bifrost transports tag
+        id: bifrost-tag
+        run: echo "tag=$(make print-bifrost-tag)" >> $GITHUB_OUTPUT
+
+      - name: Restore bifrost-http cache
+        # D-35 + 04-RESEARCH.md §Pattern 4: cache key shape matches ci.yml so the
+        # release build can read cache entries seeded by the merge-time ci.yml run
+        # on the same commit's git SHA.
+        id: bifrost-cache
+        uses: actions/cache@v4
+        with:
+          path: bin/bifrost-http
+          key: bifrost-http-${{ runner.os }}-${{ matrix.goarch }}-go1.26.2-${{ steps.bifrost-tag.outputs.tag }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            bifrost-http-${{ runner.os }}-${{ matrix.goarch }}-go1.26.2-${{ steps.bifrost-tag.outputs.tag }}-
+            bifrost-http-${{ runner.os }}-${{ matrix.goarch }}-go1.26.2-
+
+      - name: Build bifrost-host (on cache miss)
+        if: steps.bifrost-cache.outputs.cache-hit != 'true'
+        run: make bifrost-host
+
+      - name: Install tools
+        run: make tools
+
+      - name: CI pipeline
+        # `make ci` = lint + test + build. Produces revenium-bifrost.so.
+        run: make ci
+
+      - name: Ad-hoc codesign (macOS only)
+        # BUILD-04 + D-37.3 + 04-RESEARCH.md §Pattern 6 + Pitfall 9: macOS 11+
+        # Apple Silicon requires all loaded binaries — including dylibs/dlopen'd
+        # `.so` files — to carry at least an ad-hoc signature, or `dlopen` fails
+        # with EXC_BAD_ACCESS. Linux `.so` files do NOT need this; gate by OS.
+        # `--force` is idempotent-replace; `--timestamp=none` suppresses the Apple
+        # timestamp-server call which would fail in CI anyway. Mirrors ci.yml.
+        if: runner.os == 'macOS'
+        run: |
+          codesign --sign - --timestamp=none --force revenium-bifrost.so
+          codesign -dvvv revenium-bifrost.so 2>&1 | grep -q "Signature=adhoc"
+
+      - name: Verify .so symbol presence
+        # Phase 4 Plan 04-01 corrected regex: `-buildmode=plugin` emits symbols
+        # under the MODULE-IMPORT-PATH prefix; `_?` tolerates Mach-O's leading
+        # underscore so the same regex works on ELF (Linux) + Mach-O (macOS).
+        # 7 symbols: Init, GetName, Cleanup, HTTPTransportPreHook, PreLLMHook,
+        # PostLLMHook, HTTPTransportStreamChunkHook.
+        run: |
+          if [ -f revenium-bifrost.so ]; then
+            echo "Plugin .so present — asserting symbol table"
+            count=$(nm revenium-bifrost.so | grep -cE ' T _?github\.com/revenium/revenium-bifrost-plugin\.(Init|GetName|Cleanup|HTTPTransportPreHook|PreLLMHook|PostLLMHook|HTTPTransportStreamChunkHook)$')
+            if [ "$count" != "7" ]; then echo "Symbol count $count != 7 — see Pitfall 5 ( -ldflags=-s/-w breaks plugin.Lookup)" && exit 1; fi
+          else
+            echo "FATAL: revenium-bifrost.so not present after `make ci` — release build cannot proceed"
+            exit 1
+          fi
+
+      - name: Verify build flags (BUILD-03)
+        # BUILD-03 + 04-RESEARCH.md §Pattern 8: positive assertions on
+        # -trimpath=true, -buildmode=plugin, CGO_ENABLED=1; negative assertions
+        # on -ldflags=-s and -ldflags=-w (T-04-05-05 mitigation: prevents the
+        # forbidden strip flags from reaching release-time builds).
+        run: |
+          if [ ! -f revenium-bifrost.so ]; then
+            echo "FATAL: revenium-bifrost.so not present — cannot verify build flags"
+            exit 1
+          fi
+          info=$(go version -m revenium-bifrost.so)
+          echo "$info" | grep -qE "build[[:space:]]+-trimpath=true" || (echo "MISSING -trimpath=true flag (BUILD-03 Pitfall 5)"; exit 1)
+          echo "$info" | grep -qE "build[[:space:]]+-buildmode=plugin" || (echo "MISSING -buildmode=plugin flag (BUILD-03)"; exit 1)
+          echo "$info" | grep -qE "build[[:space:]]+CGO_ENABLED=1" || (echo "MISSING CGO_ENABLED=1 flag (BUILD-03)"; exit 1)
+          if echo "$info" | grep -qE "ldflags.*[-]s"; then echo "FORBIDDEN -ldflags=-s detected (Pitfall 5 — breaks plugin.Lookup)"; exit 1; fi
+          if echo "$info" | grep -qE "ldflags.*[-]w"; then echo "FORBIDDEN -ldflags=-w detected (Pitfall 5 — breaks plugin.Lookup)"; exit 1; fi
+          echo "BUILD-03 flag verification PASSED"
+
+      - name: Rename .so with version + os + arch + Go version
+        # D-37.2 canonical version-bearing shape: embed the tag, GOOS, GOARCH, and Go
+        # version in the filename so downstream consumers can identify the exact
+        # artifact version from the filename alone. ${GITHUB_REF_NAME} is the tag
+        # value when triggered by `push.tags` (T-04-05-03 mitigation — GitHub-
+        # controlled, not user-controlled; Bash parameter expansion, no eval).
+        run: |
+          mv revenium-bifrost.so "revenium-bifrost_${GITHUB_REF_NAME}_${{ matrix.goos }}_${{ matrix.goarch }}_go1.26.2.so"
+          ls -l revenium-bifrost_*.so
+
+      - name: Upload .so artifact
+        # 04-RESEARCH.md §Pattern 5: per-matrix-row upload with unique name; the
+        # release job downloads them all via pattern + merge-multiple.
+        # `if-no-files-found: error` is mandatory — silent empty uploads were the
+        # most common release-pipeline failure mode pre-actions/upload-artifact@v4.
+        uses: actions/upload-artifact@v4
+        with:
+          name: revenium-bifrost-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: revenium-bifrost_*.so
+          if-no-files-found: error
+          retention-days: 7
+
+  # Single-runner release job. Job-level `contents: write` override (Pattern 9
+  # least-privilege) limits the GITHUB_TOKEN's write scope to JUST this job;
+  # the matrix `build` jobs above run with the workflow-default `contents: read`
+  # (T-04-05-02 mitigation — blast-radius limited to release-asset uploads on
+  # this specific tag).
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        # `fetch-depth: 0` is required so `git describe --tags --abbrev=0 HEAD^`
+        # can find the previous tag for changelog rendering.
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all .so artifacts
+        # 04-RESEARCH.md §Pattern 5: `merge-multiple: true` flattens all 4
+        # uploaded artifacts (each with its own unique name) into a single
+        # `dist/` directory, preserving the per-file rename done in the build
+        # job. Without merge-multiple, each artifact would unpack into its own
+        # subdirectory (revenium-bifrost-linux-amd64/, etc.) and the
+        # subsequent sha256 + softprops upload would need glob-walk logic.
+        uses: actions/download-artifact@v4
+        with:
+          pattern: revenium-bifrost-*
+          merge-multiple: true
+          path: dist/
+
+      - name: Generate sha256 checksums
+        # D-37.2: per-artifact `.sha256` + combined `checksums.txt`.
+        # `sha256sum *.so > checksums.txt` produces the standard
+        # `<sha256>  <filename>` format that `sha256sum -c checksums.txt`
+        # consumes on the user's side. Per-file `.sha256` files mirror
+        # the standard ecosystem convention for tools that download a single
+        # artifact and want a one-line verification companion.
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          ls -l
+          for f in *.so; do
+            sha256sum "$f" > "${f}.sha256"
+          done
+          sha256sum *.so > checksums.txt
+          echo "---- dist/ contents ----"
+          ls -l
+          echo "---- checksums.txt ----"
+          cat checksums.txt
+
+      - name: Render changelog
+        # 04-RESEARCH.md §Pattern 9: `git log <previous-tag>..HEAD` with a
+        # multi-line $GITHUB_OUTPUT heredoc fence. The HEAD^ trick walks past
+        # the just-pushed tag (which IS HEAD) so `git describe` finds the
+        # previous tag. For the very first release, `git describe` exits
+        # non-zero and the `|| echo ""` fallback emits the full `git log`.
+        id: changelog
+        run: |
+          set -euo pipefail
+          previous=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -n "$previous" ]; then
+            echo "Previous tag: $previous"
+            log=$(git log --pretty=format:'* %s (%h)' "$previous"..HEAD)
+          else
+            echo "No previous tag — emitting full history"
+            log=$(git log --pretty=format:'* %s (%h)')
+          fi
+          {
+            echo "previous_tag=${previous:-<none>}"
+            echo "log<<LOG_EOF"
+            echo "$log"
+            echo "LOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        # 04-RESEARCH.md §Pattern 9: softprops/action-gh-release@v2 (NOT
+        # the Pro-only packager path; NOT actions/create-release — that action
+        # is archived).
+        # Tag-pinned `@v2` is acceptable in Phase 4 (T-04-05-01 disposition:
+        # accept-with-followup); Phase 5 DOC-02 / public-export cleanup will
+        # SHA-pin all community actions across both ci.yml and release.yml.
+        # `fail_on_unmatched_files: true` is mandatory: a silent zero-asset
+        # release would be a worse failure mode than a loud build error.
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.so
+            dist/*.sha256
+            dist/checksums.txt
+          fail_on_unmatched_files: true
+          body: |
+            ## Revenium Bifrost Plugin ${{ github.ref_name }}
+
+            Native Go Bifrost plugin (`.so`) that adds Revenium budget enforcement
+            and AI usage metering to the [Bifrost LLM proxy](https://docs.getbifrost.ai/).
+
+            **Built with:** Go 1.26.2 against Bifrost `transports/v1.5.3`
+            (`core/v1.5.11`).
+
+            **Compatibility matrix:** see the README in this repository for the
+            Plugin Version ↔ Bifrost Version ↔ Go Version table. The plugin's Go
+            toolchain (1.26.2) MUST match the Bifrost host's Go toolchain
+            exactly — `plugin.Open()` fails at load otherwise. Verify with:
+            `go version -m /path/to/bifrost-http | head -1`.
+
+            **Assets:** four native `.so` files (one per supported OS/arch),
+            each with a companion `.sha256`, plus a combined `checksums.txt`
+            covering all four. Verify with:
+            `sha256sum -c checksums.txt` from a directory containing the
+            downloaded `.so` files.
+
+            **macOS quarantine note:** the `.so` files are ad-hoc codesigned
+            (`codesign --sign - --timestamp=none`); Apple Developer ID +
+            notarization is deferred to a future OPS release. If macOS
+            quarantine blocks `dlopen`, run:
+            `xattr -d com.apple.quarantine revenium-bifrost_*.so`
+            after downloading.
+
+            ### Changes since ${{ steps.changelog.outputs.previous_tag }}
+
+            ${{ steps.changelog.outputs.log }}

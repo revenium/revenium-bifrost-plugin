@@ -1,0 +1,22 @@
+{{/* Schema verified against transports/v1.5.3 ConfigData on 2026-05-20 — keys are `client` (NOT client_config) and `plugins` (NOT plugin_configs). See 01-06-PLAN.md Warning 12. Mirrors spike/contract/config.json.tmpl; the only deltas are (a) plugin name is "revenium" (production GetName() return value — verified at plugin.go:137) NOT "revenium-spike", and (b) the template var is renamed SpikeSoPath → PluginSoPath. */}}
+{
+  "client": {
+    "drop_excess_requests": false,
+    "initial_pool_size": 1
+  },
+  "providers": {
+    "openai": {
+      "keys": [{"name": "integration-default", "value": "integration-fake-openai-key", "models": ["*"], "weight": 1.0}],
+      "network_config": {
+        "base_url": "{{.MockProviderURL}}"
+      }
+    }
+  },
+  "plugins": [
+    {
+      "enabled": true,
+      "name": "revenium",
+      "path": "{{.PluginSoPath}}"
+    }
+  ]
+}
